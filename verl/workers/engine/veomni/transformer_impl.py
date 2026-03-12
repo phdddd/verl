@@ -15,12 +15,14 @@
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import torch
 import torch.distributed as dist
 from tensordict import TensorDict
 from torch.distributed.tensor import DTensor
+from veomni.data.data_collator import MainCollator as Preforward
+from veomni.data.data_collator import PostCollator as Postforward
 from veomni.distributed import parallel_state
 from veomni.distributed.offloading import build_activation_offloading_context
 from veomni.distributed.torch_parallelize import build_parallelize_model
@@ -134,6 +136,36 @@ class VeOmniEngine(FSDPEngine):
             if self.engine_config.use_torch_compile  #  use torch compile by default
             else entropy_from_logits
         )
+        
+        # Build preforward and postforward hooks
+        self._build_preforward_postforward()
+
+    def _build_preforward_postforward(self):
+        """
+        Build preforward and postforward hooks.
+        """
+        self.pre_forward = Preforward()
+        self.post_forward = Postforward()
+        
+    def preforward(self, micro_batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Preprocess micro batches before forward pass.
+        """
+        # Convert NestedTensor to regular Tensor list if needed
+        processed_micro_batch = []
+        for sample in micro_batch:
+            processed_sample = {}
+            for key, value in sample.items():
+                if hasattr(value, 'values') and callable(getattr(value, 'values')):  # Check if it's a NestedTensor
+                    processed_sample[key] = value.values()  # Convert to list of tensors
+                else:
+                    processed_sample[key] = value
+            processed_micro_batch.append(processed_sample)
+        
+        micro_batch = self.pre_forward(processed_micro_batch)
+        # Move tensors to device
+        micro_batch = {k: v.to(get_device_id(), non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in micro_batch.items()}
+        return micro_batch
 
     def initialize(self):
         """
@@ -287,13 +319,29 @@ class VeOmniEngine(FSDPEngine):
         output_lst = []
 
         for micro_batch in micro_batches:
+            # Convert TensorDict to list of dicts for preforward
+            micro_batch_list = [{k: v for k, v in micro_batch.items()}] if hasattr(micro_batch, 'items') else micro_batch
+            
+            # Apply preforward processing
+            processed_micro_batch = self.preforward(micro_batch_list)
+            
+            # Convert back to TensorDict if needed
+            if not isinstance(processed_micro_batch, TensorDict):
+                processed_micro_batch = TensorDict(processed_micro_batch)
+            
             with self.model_fwd_context:
-                loss, meta_info = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
+                # Get model outputs using forward_step with loss computation
+                loss, model_output = self.forward_step(processed_micro_batch, loss_function=loss_function, forward_only=forward_only)
+                
+                # Apply postforward processing if needed (for model output processing)
+                if hasattr(model_output["model_output"], 'logits'):
+                    self.post_forward(model_output["model_output"], processed_micro_batch)
+            
             if not forward_only:
                 with self.model_bwd_context:
                     loss.backward()
 
-            output_lst.append(meta_info)
+            output_lst.append(model_output)
 
         return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
 
@@ -585,9 +633,5 @@ class VeOmniEngineWithLMHead(VeOmniEngine, FSDPEngineWithLMHead):
             image_mask = input_ids_rmpad == VL_TYPE2INDEX[self.module.config.model_type]["IMAGE_INPUT_INDEX"]
             video_mask = input_ids_rmpad == VL_TYPE2INDEX[self.module.config.model_type]["VIDEO_INPUT_INDEX"]
             model_inputs.update({"image_mask": image_mask, "video_mask": video_mask})
-
-            if parallel_state.get_parallel_state().sp_enabled:
-                omni_sequence_shard_collator = OmniSequenceShardCollator()
-                omni_sequence_shard_collator(model_inputs)
 
         return model_inputs, output_args
