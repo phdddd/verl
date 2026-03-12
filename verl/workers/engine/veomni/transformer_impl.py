@@ -151,7 +151,18 @@ class VeOmniEngine(FSDPEngine):
         """
         Preprocess micro batches before forward pass.
         """
-        micro_batch = self.pre_forward(micro_batch)
+        # Convert NestedTensor to regular Tensor list if needed
+        processed_micro_batch = []
+        for sample in micro_batch:
+            processed_sample = {}
+            for key, value in sample.items():
+                if hasattr(value, 'values') and callable(getattr(value, 'values')):  # Check if it's a NestedTensor
+                    processed_sample[key] = value.values()  # Convert to list of tensors
+                else:
+                    processed_sample[key] = value
+            processed_micro_batch.append(processed_sample)
+        
+        micro_batch = self.pre_forward(processed_micro_batch)
         # Move tensors to device
         micro_batch = {k: v.to(get_device_id(), non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in micro_batch.items()}
         return micro_batch
