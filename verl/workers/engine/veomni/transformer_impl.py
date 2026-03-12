@@ -146,6 +146,48 @@ class VeOmniEngine(FSDPEngine):
         """
         self.pre_forward = Preforward()
         self.post_forward = Postforward()
+        
+    def preforward(self, micro_batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Preprocess micro batches before forward pass.
+        """
+        micro_batch = self.pre_forward(micro_batch)
+        # Move tensors to device
+        micro_batch = {k: v.to(get_device_id(), non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in micro_batch.items()}
+        return micro_batch
+        
+    def postforward(self, outputs, micro_batch: Dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """
+        Postprocess model outputs after forward pass.
+        """
+        from torch import nn
+        from veomni.distributed.parallel_state import get_parallel_state
+        from veomni.distributed.sequence_parallel import gather_outputs
+        
+        outputs = self.post_forward(outputs, micro_batch)
+        
+        logits = outputs.logits
+        labels = micro_batch["labels"]
+        
+        logits = torch.cat(logits, dim=0)
+        
+        if get_parallel_state().sp_enabled:
+            labels = gather_outputs(labels, gather_dim=-1, group=get_parallel_state().sp_group)
+            labels = labels[:, : logits.shape[0]]  # unpad sp_pad
+        else:
+            labels = nn.functional.pad(labels, (0, 1), value=-100)
+            labels = labels[..., 1:].contiguous()
+        
+        logits = logits.float()
+        shift_labels = labels.view(-1)
+        
+        loss = nn.functional.cross_entropy(logits, shift_labels, ignore_index=-100, reduction="mean")
+        
+        outputs.loss = loss
+        outputs.logits = logits  # logits_list
+        
+        # Return loss and empty metrics dict (since we don't have mean_global_loss in this context)
+        return loss, {}
 
     def initialize(self):
         """
@@ -303,24 +345,28 @@ class VeOmniEngine(FSDPEngine):
             micro_batch_list = [{k: v for k, v in micro_batch.items()}] if hasattr(micro_batch, 'items') else micro_batch
             
             # Apply preforward processing
-            processed_micro_batch = self.pre_forward(micro_batch_list)
+            processed_micro_batch = self.preforward(micro_batch_list)
             
             # Convert back to TensorDict if needed
             if not isinstance(processed_micro_batch, TensorDict):
                 processed_micro_batch = TensorDict(processed_micro_batch)
             
             with self.model_fwd_context:
-                loss, meta_info = self.forward_step(processed_micro_batch, loss_function=loss_function, forward_only=forward_only)
+                # Get model outputs using forward_step without loss computation
+                _, model_output = self.forward_step(processed_micro_batch, loss_function=None, forward_only=True)
                 
-                # Apply postforward processing if needed
-                if hasattr(meta_info, 'logits'):
-                    self.post_forward(meta_info, processed_micro_batch)
+                # Apply postforward processing to compute loss
+                loss, metrics = self.postforward(model_output["model_output"], processed_micro_batch)
+                
+                # Update model_output with loss and metrics
+                model_output["loss"] = loss.detach().item()
+                model_output["metrics"] = metrics
             
             if not forward_only:
                 with self.model_bwd_context:
                     loss.backward()
 
-            output_lst.append(meta_info)
+            output_lst.append(model_output)
 
         return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
 
